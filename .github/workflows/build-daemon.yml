@@ -1,0 +1,56 @@
+name: Build waku-daemon (linux x86_64)
+
+on:
+  push:
+    branches:
+      - fix/opencode2-ga-compat
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  daemon:
+    name: waku-daemon linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            clang \
+            cmake \
+            libfontconfig-dev \
+            pkg-config
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: daemon-ubuntu-22.04-rust-1.96.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            daemon-ubuntu-22.04-rust-1.96.0-
+
+      - name: Build waku-daemon release
+        run: cargo build --locked --release --package waku-daemon --bin waku-daemon
+
+      - name: Smoke check
+        run: |
+          ls -lh target/release/waku-daemon
+          ./target/release/waku-daemon --help 2>&1 | head -n 20 || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: waku-daemon-linux-x86_64
+          path: target/release/waku-daemon
+          if-no-files-found: error
