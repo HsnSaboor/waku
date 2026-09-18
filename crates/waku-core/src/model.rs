@@ -7,6 +7,13 @@ pub use waku_protocol::model::*;
 pub fn provider_probe(provider: ProviderKind, binary_override: Option<&str>) -> ProviderProbe {
     let path = match binary_override {
         Some(binary) => crate::command_env::resolve_binary_override(binary),
+        // The GA 2.x line ships a single `opencode` binary; the beta-era
+        // `opencode2` name only exists while that channel is installed. Fall
+        // back so OpenCode 2 detects out of the box without an override.
+        None if provider == ProviderKind::OpenCode2 => {
+            crate::command_env::find_executable(provider.command())
+                .or_else(|| crate::command_env::find_executable("opencode"))
+        }
         None => crate::command_env::find_executable(provider.command()),
     };
     ProviderProbe {

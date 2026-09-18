@@ -247,8 +247,12 @@ pub(crate) enum ForkBoundaryKind {
     Through,
 }
 
-/// The fork boundary as the server ACCEPTS it. `through` takes no message id
-/// at all, and sending one is a 400.
+/// The fork boundary as the server ACCEPTS it.
+///
+/// Beta took `{type: before|through, messageID?}` under a `boundary` key;
+/// GA 2.x (verified v2.0.6) takes a flat `{before: msgID|null}` — and the
+/// caller in [`fork`] tries GA first, then beta. `through` takes no message
+/// id at all on beta, and sending one is a 400.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub(crate) enum ForkRequestBoundary {
@@ -578,18 +582,33 @@ pub(crate) struct SessionExport {
 /// The inbox entry `POST /prompt` answers with.
 ///
 /// The beta build renamed this member from `data` to `payload`; the older name
-/// is gone, not aliased.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// is gone, not aliased. GA 2.x (verified v2.0.6) further stamps `time`
+/// (`{created,...}`) instead of `timeCreated`, and may omit `type`/`delivery`
+/// on undelivered entries — so all three default rather than failing decode.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct InboxUser {
     pub id: String,
     #[serde(rename = "sessionID")]
     pub session_id: String,
-    #[serde(rename = "timeCreated")]
+    #[serde(rename = "timeCreated", default = "inbox_time_default")]
     pub time_created: f64,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "inbox_kind_default")]
     pub kind: String,
     pub payload: Value,
+    #[serde(default = "inbox_delivery_default")]
     pub delivery: Delivery,
+}
+
+fn inbox_time_default() -> f64 {
+    0.0
+}
+
+fn inbox_kind_default() -> String {
+    "user".to_owned()
+}
+
+fn inbox_delivery_default() -> Delivery {
+    Delivery::Steer
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -851,8 +870,29 @@ pub(crate) struct SkillInfo {
 
 pub(crate) fn health(endpoint: &Endpoint) -> Result<Health> {
     // Bare payload: health is one of the routes with no `{ data }` envelope.
-    let response = request(endpoint, "GET", "/api/health", None, HEALTH_TIMEOUT)?;
-    decode(response, "health")
+    // The GA 2.x unified binary dropped `/api/health`; accept `/api/info`
+    // (`{"version","pid",...}`) as the same liveness signal.
+    if let Ok(health) = request(endpoint, "GET", "/api/health", None, HEALTH_TIMEOUT)
+        .and_then(|response| decode(response, "health"))
+    {
+        return Ok(health);
+    }
+    let info: ServerInfo = decode(
+        request(endpoint, "GET", "/api/info", None, HEALTH_TIMEOUT)?,
+        "health",
+    )?;
+    Ok(Health {
+        healthy: true,
+        version: info.version,
+        pid: info.pid,
+    })
+}
+
+/// `GET /api/info` on the GA 2.x unified binary. Bare payload, like health.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub(crate) struct ServerInfo {
+    pub version: String,
+    pub pid: u32,
 }
 
 /// Creates a session with a CLIENT-MINTED id.
@@ -907,17 +947,33 @@ pub(crate) fn delete_session(endpoint: &Endpoint, session: &str) -> Result<()> {
 
 /// Runtime-only MCP registration, scoped to one location. This never writes
 /// the shared service's configuration files.
+///
+/// GA 2.x moved these under `/api/experimental` (verified v2.0.6); the beta
+/// routes 404 there. Try GA first, fall through.
 pub(crate) fn add_mcp(
     endpoint: &Endpoint,
     directory: &str,
     server: &str,
     config: &Value,
 ) -> Result<()> {
-    let path = format!(
-        "/api/mcp/{}{}",
+    let query = location_query(Some(directory));
+    let ga = format!(
+        "/api/experimental/mcp/{}{}",
         encode_path_segment(server),
-        location_query(Some(directory))
+        query
     );
+    if request(
+        endpoint,
+        "PUT",
+        &ga,
+        Some(&json!({"config": config})),
+        REQUEST_TIMEOUT,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+    let path = format!("/api/mcp/{}{}", encode_path_segment(server), query);
     request(
         endpoint,
         "PUT",
@@ -933,11 +989,16 @@ pub(crate) fn list_mcp(endpoint: &Endpoint, directory: &str) -> Result<Vec<Value
 }
 
 pub(crate) fn remove_mcp(endpoint: &Endpoint, directory: &str, server: &str) -> Result<()> {
-    let path = format!(
-        "/api/mcp/{}{}",
+    let query = location_query(Some(directory));
+    let ga = format!(
+        "/api/experimental/mcp/{}{}",
         encode_path_segment(server),
-        location_query(Some(directory))
+        query
     );
+    if request(endpoint, "DELETE", &ga, None, REQUEST_TIMEOUT).is_ok() {
+        return Ok(());
+    }
+    let path = format!("/api/mcp/{}{}", encode_path_segment(server), query);
     request(endpoint, "DELETE", &path, None, REQUEST_TIMEOUT)?;
     Ok(())
 }
@@ -948,6 +1009,23 @@ pub(crate) fn put_instruction_entry(
     key: &str,
     value: &str,
 ) -> Result<()> {
+    // GA 2.x moved these under `/api/experimental` (verified v2.0.6).
+    let ga = format!(
+        "/api/experimental/session/{}/instructions/entries/{}",
+        encode_path_segment(session),
+        encode_path_segment(key)
+    );
+    if request(
+        endpoint,
+        "PUT",
+        &ga,
+        Some(&json!({"value": value})),
+        REQUEST_TIMEOUT,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
     let path = format!(
         "/api/session/{}/instructions/entries/{}",
         encode_path_segment(session),
@@ -968,6 +1046,15 @@ pub(crate) fn remove_instruction_entry(
     session: &str,
     key: &str,
 ) -> Result<()> {
+    // Same GA/beta split as [`put_instruction_entry`].
+    let ga = format!(
+        "/api/experimental/session/{}/instructions/entries/{}",
+        encode_path_segment(session),
+        encode_path_segment(key)
+    );
+    if request(endpoint, "DELETE", &ga, None, REQUEST_TIMEOUT).is_ok() {
+        return Ok(());
+    }
     let path = format!(
         "/api/session/{}/instructions/entries/{}",
         encode_path_segment(session),
@@ -978,6 +1065,20 @@ pub(crate) fn remove_instruction_entry(
 }
 
 pub(crate) fn rename_session(endpoint: &Endpoint, session: &str, title: &str) -> Result<()> {
+    // GA 2.x dropped `POST …/rename` (verified v2.0.6: 404); the title now
+    // patches on the session itself. Try PATCH first, fall through to beta.
+    let path = format!("/api/session/{}", encode_path_segment(session));
+    if request(
+        endpoint,
+        "PATCH",
+        &path,
+        Some(&json!({ "title": title })),
+        REQUEST_TIMEOUT,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
     let path = format!("/api/session/{}/rename", encode_path_segment(session));
     let body = json!({ "title": title });
     request(endpoint, "POST", &path, Some(&body), REQUEST_TIMEOUT)?;
@@ -1023,12 +1124,23 @@ pub(crate) fn export_session(
     session: &str,
     sanitize: bool,
 ) -> Result<SessionExport> {
-    let path = format!(
+    // GA 2.x moved the transcript export under `/api/experimental`; the beta
+    // route 404s there (verified v2.0.6). Try beta first, fall through.
+    let beta = format!(
         "/api/session/{}/export?sanitize={sanitize}",
         encode_path_segment(session)
     );
-    let response = request(endpoint, "GET", &path, None, TRANSFER_TIMEOUT)?;
-    decode(data(response, "session export")?, "session export")
+    match request(endpoint, "GET", &beta, None, TRANSFER_TIMEOUT) {
+        Ok(response) => decode(data(response, "session export")?, "session export"),
+        Err(_) => {
+            let path = format!(
+                "/api/experimental/session/{}/export?sanitize={sanitize}",
+                encode_path_segment(session)
+            );
+            let response = request(endpoint, "GET", &path, None, TRANSFER_TIMEOUT)?;
+            decode(data(response, "session export")?, "session export")
+        }
+    }
 }
 
 /// Submits a prompt and returns the inbox entry it became.
@@ -1062,11 +1174,20 @@ pub(crate) fn command(
     delivery: Option<Delivery>,
 ) -> Result<()> {
     let path = format!("/api/session/{}/command", encode_path_segment(session));
-    let mut body = json!({"command": name, "text": arguments});
+    // GA 2.x takes `{name, text}` (both required, verified v2.0.6); the beta
+    // channel took `{command, text}`. Try GA first, fall through.
+    let mut ga = json!({"name": name, "text": arguments});
     if let Some(delivery) = delivery {
-        body["delivery"] = json!(delivery);
+        ga["delivery"] = json!(delivery);
     }
-    request(endpoint, "POST", &path, Some(&body), REQUEST_TIMEOUT)?;
+    if request(endpoint, "POST", &path, Some(&ga), REQUEST_TIMEOUT).is_ok() {
+        return Ok(());
+    }
+    let mut beta = json!({"command": name, "text": arguments});
+    if let Some(delivery) = delivery {
+        beta["delivery"] = json!(delivery);
+    }
+    request(endpoint, "POST", &path, Some(&beta), REQUEST_TIMEOUT)?;
     Ok(())
 }
 
@@ -1082,7 +1203,27 @@ pub(crate) fn list_inbox(endpoint: &Endpoint, session: &str) -> Result<Vec<Value
 }
 
 /// Promotes a queued entry so it interrupts the running turn.
+///
+/// GA 2.x replaced the `/steer` + `/queue` sub-routes with
+/// `PATCH …/inbox/{id} {delivery}` (verified v2.0.6); the beta routes 404
+/// there. Try GA first, fall through.
 pub(crate) fn steer_inbox(endpoint: &Endpoint, session: &str, inbox_id: &str) -> Result<()> {
+    let path = format!(
+        "/api/session/{}/inbox/{}",
+        encode_path_segment(session),
+        encode_path_segment(inbox_id)
+    );
+    if request(
+        endpoint,
+        "PATCH",
+        &path,
+        Some(&json!({ "delivery": Delivery::Steer })),
+        REQUEST_TIMEOUT,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
     let path = format!(
         "/api/session/{}/inbox/{}/steer",
         encode_path_segment(session),
@@ -1093,7 +1234,25 @@ pub(crate) fn steer_inbox(endpoint: &Endpoint, session: &str, inbox_id: &str) ->
 }
 
 /// Demotes an entry so it waits for the running turn to finish.
+///
+/// Same GA/beta split as [`steer_inbox`].
 pub(crate) fn queue_inbox(endpoint: &Endpoint, session: &str, inbox_id: &str) -> Result<()> {
+    let path = format!(
+        "/api/session/{}/inbox/{}",
+        encode_path_segment(session),
+        encode_path_segment(inbox_id)
+    );
+    if request(
+        endpoint,
+        "PATCH",
+        &path,
+        Some(&json!({ "delivery": Delivery::Queue })),
+        REQUEST_TIMEOUT,
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
     let path = format!(
         "/api/session/{}/inbox/{}/queue",
         encode_path_segment(session),
@@ -1134,6 +1293,15 @@ pub(crate) fn fork(
     boundary: &ForkRequestBoundary,
 ) -> Result<SessionInfo> {
     let path = format!("/api/session/{}/fork", encode_path_segment(session));
+    // GA 2.x takes flat `{before: msgID|null}` (verified v2.0.6); the beta
+    // channel took `{boundary: {type, messageID?}}`. Try GA first.
+    let ga = match boundary {
+        ForkRequestBoundary::Before { message_id } => json!({ "before": message_id }),
+        ForkRequestBoundary::Through => json!({ "before": Value::Null }),
+    };
+    if let Ok(response) = request(endpoint, "POST", &path, Some(&ga), FORK_TIMEOUT) {
+        return decode(data(response, "fork")?, "fork");
+    }
     let body = json!({ "boundary": boundary });
     let response = request(endpoint, "POST", &path, Some(&body), FORK_TIMEOUT)?;
     decode(data(response, "fork")?, "fork")
@@ -1907,6 +2075,26 @@ mod tests {
         .unwrap();
         assert_eq!(entry.delivery, Delivery::Steer);
         assert_eq!(entry.payload["text"], json!("hi"));
+        // GA 2.x shape (verified v2.0.6): `time` object, no `type`/`delivery`
+        // on undelivered entries — all three must default, not fail decode.
+        let ga: InboxUser = serde_json::from_value(json!({
+            "id": "msg_0b44700080014kHy3XKvoiu3RH",
+            "sessionID": "ses_1",
+            "time": { "created": 1789730947082 },
+            "type": "user",
+            "payload": { "text": "say hi" },
+            "delivery": "steer",
+        }))
+        .unwrap();
+        assert_eq!(ga.payload["text"], json!("say hi"));
+        let minimal: InboxUser = serde_json::from_value(json!({
+            "id": "msg_2",
+            "sessionID": "ses_1",
+            "payload": { "text": "hi" },
+        }))
+        .unwrap();
+        assert_eq!(minimal.kind, "user");
+        assert_eq!(minimal.delivery, Delivery::Steer);
     }
 
     #[test]
@@ -1990,6 +2178,25 @@ mod tests {
         let error = list_models(&endpoint, Some("/nope/nope")).unwrap_err();
         assert!(error.is_unresolvable_location(), "{error:?}");
         assert_eq!(error.status(), Some(500));
+    }
+
+    #[test]
+    fn health_falls_back_to_server_info_when_health_is_gone() {
+        // opencode v2.0.6 GA: `/api/health` 404s, `/api/info` answers
+        // `{"version","pid",...}`. The first canned response must fail, the
+        // second must produce the same liveness signal health would have.
+        let body = r#"{"version":"2.0.6","pid":58286,"urls":["http://127.0.0.1:49374"],"paths":{"tmp":"/tmp/opencode"}}"#;
+        let endpoint = serve_responses(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        ]);
+        let health = health(&endpoint).unwrap();
+        assert!(health.healthy);
+        assert_eq!(health.pid, 58286);
+        assert_eq!(health.version, "2.0.6");
     }
 
     #[test]

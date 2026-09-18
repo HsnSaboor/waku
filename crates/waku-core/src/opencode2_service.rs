@@ -59,6 +59,10 @@ use crate::http_wire::{
 const SERVICE_USER: &str = "opencode";
 const REGISTRATION_FILE: &str = "service.json";
 const HEALTH_ROUTE: &str = "/api/health";
+/// GA 2.x unified binary dropped `/api/health`; `server.info` is its liveness
+/// equivalent. Verified against opencode v2.0.6: `/api/health` 404s while
+/// `/api/info` answers `{"version","pid",...}` with no `healthy` flag.
+const INFO_ROUTE: &str = "/api/info";
 const EVENT_ROUTE: &str = "/api/event";
 const MODEL_ROUTE: &str = "/api/model";
 
@@ -162,10 +166,35 @@ fn read_registration_file(path: &Path) -> Option<ServiceRegistration> {
 /// to talk to it with.
 pub(crate) fn probe(registration: &ServiceRegistration) -> anyhow::Result<Endpoint> {
     let endpoint = Endpoint::basic(&registration.url, SERVICE_USER, &registration.password)?;
-    let health = request_json(&endpoint, "GET", HEALTH_ROUTE, None, HEALTH_TIMEOUT)
-        .context("the OpenCode 2 service did not answer its health route")?;
-    accept_health(registration, &health)?;
-    Ok(endpoint)
+    // Beta channel answers `/api/health`; the GA 2.x unified `opencode`
+    // binary dropped it in favour of `/api/info`. Try health first so a stale
+    // port squatter that happens to serve `/api/info`-shaped JSON can never
+    // shadow the pid check below — `accept_health` still gates on pid.
+    match request_json(&endpoint, "GET", HEALTH_ROUTE, None, HEALTH_TIMEOUT) {
+        Ok(health) => {
+            accept_health(registration, &health)?;
+            Ok(endpoint)
+        }
+        Err(_) => {
+            let info = request_json(&endpoint, "GET", INFO_ROUTE, None, HEALTH_TIMEOUT)
+                .context("the OpenCode 2 service did not answer its health route")?;
+            accept_info(registration, &info)?;
+            Ok(endpoint)
+        }
+    }
+}
+
+fn accept_info(registration: &ServiceRegistration, info: &Value) -> anyhow::Result<()> {
+    // `/api/info` carries no `healthy` flag; a 2xx with the registered pid is
+    // the liveness signal. The pid comparison stays mandatory for the same
+    // reason as the health path: a stale descriptor's port may be reused.
+    if info.get("pid").and_then(Value::as_u64) != Some(u64::from(registration.pid)) {
+        bail!(
+            "the OpenCode 2 service on {} is not the process its registration names",
+            registration.url
+        );
+    }
+    Ok(())
 }
 
 fn accept_health(registration: &ServiceRegistration, health: &Value) -> anyhow::Result<()> {
@@ -673,7 +702,7 @@ fn spawn_service(binary: &Path) -> anyhow::Result<(ServiceRegistration, Endpoint
             // winner's service can still be seconds away from healthy.
             match exit {
                 Some(status) => bail!(
-                    "`opencode2 serve --service` exited ({status}) without registering a healthy service"
+                    "`opencode serve --service` exited ({status}) without registering a healthy service"
                 ),
                 None => bail!("timed out starting the OpenCode 2 background service"),
             }
@@ -1010,6 +1039,27 @@ mod tests {
             json!("session.updated")
         );
         assert!(matches!(frames[3], SseFrame::Named { .. }));
+    }
+
+    #[test]
+    fn info_without_a_healthy_flag_is_accepted_on_matching_pid() {
+        // The GA 2.x unified `opencode` binary (verified v2.0.6) dropped
+        // `/api/health`; `/api/info` answers `{"version","pid",...}` with no
+        // `healthy` flag, so pid match alone is the liveness signal.
+        assert!(
+            accept_info(
+                &registration(58286),
+                &json!({"version": "2.0.6", "pid": 58286, "urls": ["http://127.0.0.1:49374"]})
+            )
+            .is_ok()
+        );
+        assert!(
+            accept_info(
+                &registration(58286),
+                &json!({"version": "2.0.6", "pid": 99999})
+            )
+            .is_err()
+        );
     }
 
     #[test]
