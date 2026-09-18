@@ -585,7 +585,7 @@ pub(crate) struct SessionExport {
 /// is gone, not aliased. GA 2.x (verified v2.0.6) further stamps `time`
 /// (`{created,...}`) instead of `timeCreated`, and may omit `type`/`delivery`
 /// on undelivered entries — so all three default rather than failing decode.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub(crate) struct InboxUser {
     pub id: String,
     #[serde(rename = "sessionID")]
